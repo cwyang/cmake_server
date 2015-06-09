@@ -1,2 +1,2 @@
-# cmake_server
+# hoppang
 server template, cmake setting

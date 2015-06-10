@@ -4,6 +4,7 @@
    - Kazuho's h2o main.c
 */
 
+#define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
 #include <execinfo.h>
@@ -85,7 +86,7 @@ static pid_t spawnp(const char *cmd, char **argv, const int *mapped_fds)
         /* posix_spawnp of Linux does not return error if the executable does not exist, see
          * https://gist.github.com/kazuho/0c233e6f86d27d6e4f09
          */
-        int pipefds[2] = {-1, -1}, errnum;
+        int pipefds[2] = {-1, -1}, errnum, n;
         pid_t pid;
         
         /* create pipe, used for sending error codes */
@@ -109,7 +110,7 @@ static pid_t spawnp(const char *cmd, char **argv, const int *mapped_fds)
                 }
                 execvp(cmd, argv);
                 errnum = errno;
-                write(pipefds[1], &errnum, sizeof(errnum));
+                n = write(pipefds[1], &errnum, sizeof(errnum)); (void) n;       // suppress warning
                 _exit(EX_SOFTWARE);
         }
         
@@ -156,6 +157,27 @@ Error:
 #endif
 }
 
+static char *get_cmd_path(const char *cmd)
+{
+        char *root, *cmd_fullpath;
+        
+        /* just return the cmd (being strdup'ed) in case we do not need to prefix the value */
+        if (cmd[0] == '/' || strchr(cmd, '/') == NULL)
+                goto ReturnOrig;
+        
+        /* obtain root */
+        if ((root = getenv("INSTALL_ROOT")) == NULL)
+                goto ReturnOrig;
+        
+        /* build full-path and return */
+        cmd_fullpath = malloc(strlen(root) + strlen(cmd) + 2);
+        sprintf(cmd_fullpath, "%s/%s", root, cmd);
+        return cmd_fullpath;
+        
+ReturnOrig:
+        return strdup(cmd);
+}
+
 #ifdef __linux__
 static int popen_annotate_backtrace_symbols(void)
 {
@@ -179,7 +201,7 @@ static int popen_annotate_backtrace_symbols(void)
                 2, 1, /* STDOUT of the spawned process in connected to STDERR of server */
                 -1
         };
-        if (h2o_spawnp(cmd_fullpath, argv, mapped_fds) == -1) {
+        if (spawnp(cmd_fullpath, argv, mapped_fds) == -1) {
                 /* silently ignore error */
                 close(pipefds[0]);
                 close(pipefds[1]);
@@ -194,14 +216,15 @@ static int backtrace_symbols_to_fd = -1;
 
 static void on_sigfatal(int signo)
 {
-        fprintf(stderr, "received fatal signal %d; backtrace follows\n", signo);
-        
-        h2o_set_signal_handler(signo, SIG_DFL);
-
         void *frames[128];
-        int framecnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
-        backtrace_symbols_fd(frames, framecnt, backtrace_symbols_to_fd);
+        int framecnt;
 
+        set_signal_handler(signo, SIG_DFL);
+
+        framecnt = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+        fprintf(stderr, "received fatal signal %d; backtrace follows, #%d\n", signo, framecnt);
+        backtrace_symbols_fd(frames, framecnt, backtrace_symbols_to_fd);
+        
         raise(signo);
 }
 #endif
@@ -211,8 +234,10 @@ static void setup_signal_handlers(void)
         set_signal_handler(SIGTERM, on_sigterm);
         set_signal_handler(SIGPIPE, SIG_IGN);
 #ifdef __linux__
-        if ((backtrace_symbols_to_fd = popen_annotate_backtrace_symbols()) == -1)
+        if ((backtrace_symbols_to_fd = popen_annotate_backtrace_symbols()) == -1) {
                 backtrace_symbols_to_fd = 2;
+        }
+        
         set_signal_handler(SIGABRT, on_sigfatal);
         set_signal_handler(SIGBUS, on_sigfatal);
         set_signal_handler(SIGFPE, on_sigfatal);
@@ -223,6 +248,8 @@ static void setup_signal_handlers(void)
 
 static size_t get_nrproc()
 {
+        return 2;
+        
 #if defined(_SC_NPROCESSORS_ONLN)
         return (size_t)sysconf(_SC_NPROCESSORS_ONLN);
 #elif defined(CTL_HW) && defined(HW_AVAILCPU)
@@ -250,7 +277,7 @@ NORETURN static void *run_loop(void *_thread_index)
         fprintf(stderr, "%lu (pid:%d)\n",  thread_index, (int) getpid());
 
         sleep(1);
-        
+
         /* the process that detects num_connections becoming zero performs the last cleanup */
         if (conf.pid_file != NULL)
                 unlink(conf.pid_file);
@@ -310,6 +337,8 @@ int main(int argc, char **argv)
         int r;
         
         conf.num_threads = get_nrproc();
+
+        fprintf(stderr, "[INFO] num_threads is %lu\n", conf.num_threads);
 
         /* option */
         r = parse_option(argc, argv);   /* returns optind */
@@ -1416,7 +1445,7 @@ static int popen_annotate_backtrace_symbols(void)
         2, 1, /* STDOUT of the spawned process in connected to STDERR of h2o */
         -1
     };
-    if (h2o_spawnp(cmd_fullpath, argv, mapped_fds) == -1) {
+    if (spawnp(cmd_fullpath, argv, mapped_fds) == -1) {
         /* silently ignore error */
         close(pipefds[0]);
         close(pipefds[1]);
